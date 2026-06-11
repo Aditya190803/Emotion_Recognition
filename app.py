@@ -273,7 +273,7 @@ def render_sidebar():
             st.sidebar.caption(f"  {split}: {c:,}")
     else:
         st.sidebar.error("❌ No dataset found")
-        if st.sidebar.button("⬇️ Download FER2013", use_container_width=True):
+        if st.sidebar.button("⬇️ Download FER2013", width="stretch", key="dl_dataset"):
             with st.spinner("Downloading dataset..."):
                 proc = subprocess.run(
                     [sys.executable, "download_dataset.py"],
@@ -293,7 +293,7 @@ def render_sidebar():
     st.sidebar.subheader("🏋️ Train Model")
     if TRAIN_LOCK_PATH.exists():
         st.sidebar.info("⏳ Training in progress...")
-        if st.sidebar.button("🔄 Refresh Status", use_container_width=True):
+        if st.sidebar.button("🔄 Refresh Status", width="stretch", key="refresh_status"):
             st.rerun()
     else:
         epochs = st.sidebar.slider("Epochs", 5, 100, 50, 5)
@@ -306,7 +306,7 @@ def render_sidebar():
         if st.sidebar.button(
             "▶️ Start Training",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=train_disabled,
         ):
             # Clear old log and start training subprocess
@@ -418,12 +418,12 @@ def tab_live_camera():
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        if st.button("▶️ Start Camera", disabled=st.session_state.camera_running, use_container_width=True):
+        if st.button("▶️ Start Camera", disabled=st.session_state.camera_running, width="stretch", key="start_cam"):
             st.session_state.camera_running = True
             st.session_state.cam_frames = 0
             st.rerun()
     with col2:
-        if st.button("⏹️ Stop Camera", disabled=not st.session_state.camera_running, use_container_width=True):
+        if st.button("⏹️ Stop Camera", disabled=not st.session_state.camera_running, width="stretch", key="stop_cam"):
             st.session_state.camera_running = False
             st.rerun()
     with col3:
@@ -452,7 +452,7 @@ def tab_live_camera():
 
                 annotated, results = annotate_frame(frame)
                 annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-                feed_placeholder.image(annotated_rgb, use_container_width=True)
+                feed_placeholder.image(annotated_rgb, width="stretch")
 
                 if results:
                     top = results[0]
@@ -477,7 +477,7 @@ def tab_live_camera():
             st.subheader("Recent Detections")
             df = pd.DataFrame(st.session_state.emotion_history)
             counts = df["label"].value_counts().reindex(EMOTION_LABELS, fill_value=0)
-            st.bar_chart(counts, use_container_width=True)
+            st.bar_chart(counts, width="stretch")
 
 
 # ---------------------------------------------------------------------------
@@ -503,9 +503,9 @@ def tab_upload():
 
         col1, col2 = st.columns(2)
         with col1:
-            st.image(pil_img, caption="Original", use_container_width=True)
+            st.image(pil_img, caption="Original", width="stretch")
         with col2:
-            st.image(annotated_rgb, caption="Detected", use_container_width=True)
+            st.image(annotated_rgb, caption="Detected", width="stretch")
 
         st.session_state.last_upload_result = results
 
@@ -555,8 +555,8 @@ def tab_model_info():
     if stats:
         df_stats = pd.DataFrame(stats)
         df_pivot = df_stats.pivot(index="emotion", columns="split", values="count").fillna(0).astype(int)
-        st.bar_chart(df_pivot, use_container_width=True)
-        st.dataframe(df_pivot, use_container_width=True)
+        st.bar_chart(df_pivot, width="stretch")
+        st.dataframe(df_pivot, width="stretch")
     else:
         st.info("No dataset found. Download via the sidebar or run `python download_dataset.py`.")
 
@@ -577,12 +577,21 @@ def tab_model_info():
 
         arch = []
         for layer in model.layers:
+            try:
+                if hasattr(layer, "output_shape") and layer.output_shape is not None:
+                    output_shape = str(layer.output_shape)
+                elif hasattr(layer, "output"):
+                    output_shape = str(layer.output.shape)
+                else:
+                    output_shape = "?"
+            except Exception:
+                output_shape = "?"
             arch.append({
                 "Layer": layer.name,
                 "Type": layer.__class__.__name__,
-                "Output Shape": str(layer.output_shape),
+                "Output Shape": output_shape,
             })
-        st.dataframe(pd.DataFrame(arch), use_container_width=True)
+        st.dataframe(pd.DataFrame(arch), width="stretch")
     else:
         st.info("No model loaded. Train a model from the sidebar.")
 
@@ -599,7 +608,7 @@ def tab_model_info():
                 "Size (MB)": f"{stat.st_size / 1_048_576:.2f}",
                 "Modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
             })
-        st.dataframe(pd.DataFrame(model_data), use_container_width=True)
+        st.dataframe(pd.DataFrame(model_data), width="stretch")
     else:
         st.info("No checkpoints found.")
 
@@ -613,8 +622,8 @@ def tab_model_info():
             hist = json.load(f)
         df_hist = pd.DataFrame(hist)
         df_hist["epoch"] = df_hist.index + 1
-        st.line_chart(df_hist.set_index("epoch")[["accuracy", "val_accuracy"]], use_container_width=True)
-        st.line_chart(df_hist.set_index("epoch")[["loss", "val_loss"]], use_container_width=True)
+        st.line_chart(df_hist.set_index("epoch")[["accuracy", "val_accuracy"]], width="stretch")
+        st.line_chart(df_hist.set_index("epoch")[["loss", "val_loss"]], width="stretch")
     else:
         st.info("No training history found.")
 
