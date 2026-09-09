@@ -31,7 +31,13 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 from dotenv import load_dotenv
-import tensorflow as tf
+
+try:
+    import tensorflow as tf
+    _TF_AVAILABLE = True
+except ImportError:  # Streamlit Cloud: TF is optional, ViT backend needs only torch
+    tf = None  # type: ignore
+    _TF_AVAILABLE = False
 
 load_dotenv()
 
@@ -119,7 +125,10 @@ def is_model_ready() -> bool:
 
 
 @st.cache_resource(show_spinner="Loading model...")
-def load_model_cached(path: str) -> Optional[tf.keras.Model]:
+def load_model_cached(path: str):
+    if not _TF_AVAILABLE:
+        st.error("TensorFlow is not installed in this environment. Use the ViT backend.")
+        return None
     p = Path(path)
     if not p.exists():
         return None
@@ -130,7 +139,7 @@ def load_model_cached(path: str) -> Optional[tf.keras.Model]:
         return None
 
 
-def get_model() -> Optional[tf.keras.Model]:
+def get_model():
     path = get_selected_model_path()
     if path is None:
         return None
@@ -166,13 +175,15 @@ def detect_faces(gray: np.ndarray):
 # ---------------------------------------------------------------------------
 # Prediction helpers
 # ---------------------------------------------------------------------------
-def get_model_input_spec(model: tf.keras.Model) -> tuple[int, int, int]:
+def get_model_input_spec(model) -> tuple[int, int, int]:
     """Return (height, width, channels) expected by the model."""
     shape = model.input_shape
     return int(shape[1]), int(shape[2]), int(shape[3])
 
 
-def _has_builtin_normalization(model: tf.keras.Model) -> bool:
+def _has_builtin_normalization(model) -> bool:
+    if not _TF_AVAILABLE:
+        return False
     """
     True if the model normalizes inputs itself (transfer-learning models),
     i.e. it expects raw RGB values in [0, 255]. Legacy models expect /255.
@@ -194,7 +205,7 @@ def _has_builtin_normalization(model: tf.keras.Model) -> bool:
     return False
 
 
-def preprocess_face(face_roi_bgr: np.ndarray, model: tf.keras.Model) -> np.ndarray:
+def preprocess_face(face_roi_bgr: np.ndarray, model) -> np.ndarray:
     """Resize/convert a BGR face ROI to match whatever model is selected."""
     h, w, c = get_model_input_spec(model)
     face = cv2.resize(face_roi_bgr, (w, h))
