@@ -52,3 +52,11 @@ dataset/*/*/*.jpeg
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Model binaries, datasets, training logs
+*.keras
+fer2013/
+*.log
+
+# Local HF weight snapshots (re-downloadable via sidebar / --cache-model)
+models/
