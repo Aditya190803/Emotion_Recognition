@@ -10,9 +10,6 @@ No training, no local Keras checkpoints, no sidebar.
 from __future__ import annotations
 
 import os
-import time
-from collections import Counter, deque
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -34,12 +31,7 @@ EMOTION_EMOJIS = {
 }
 
 
-def is_running_on_cloud() -> bool:
-    return (
-        os.environ.get("STREAMLIT_SHARING", "") == "true"
-        or os.environ.get("STREAMLIT_CLOUD", "") == "true"
-        or Path("/mount/src").exists()
-    )
+
 
 
 @st.cache_resource(show_spinner="Loading ViT emotion model...")
@@ -60,23 +52,34 @@ def predict_roi(roi_bgr: np.ndarray) -> dict:
     return predict_emotion_vit(roi_bgr, model_id=HF_MODEL_ID)
 
 
-def annotate_frame(frame: np.ndarray) -> tuple:
+def draw_box(frame_bgr: np.ndarray, x: int, y: int, w: int, h: int, label: str, emoji: str, score: float):
+    text = f"{label} {emoji} {score * 100:.0f}%"
+    color = (0, 255, 0)
+    cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), color, 2)
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+    cv2.rectangle(frame_bgr, (x, y - th - 10), (x + tw, y), color, -1)
+    cv2.putText(frame_bgr, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+
+def annotate_frame_bgr(frame: np.ndarray) -> tuple:
+    """Detect + ViT-predict every face. Returns (annotated BGR, results)."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = get_face_cascade().detectMultiScale(
         gray, scaleFactor=1.3, minNeighbors=5, minSize=(48, 48)
     )
     results = []
     for (x, y, w, h) in faces:
-        roi = frame[y:y + h, x:x + w]
-        result = predict_roi(roi)
+        result = predict_roi(frame[y:y + h, x:x + w])
         results.append(result)
-        text = f"{result['top_label']} {result['top_emoji']} {result['top_score'] * 100:.0f}%"
-        color = (0, 255, 0)
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-        cv2.rectangle(frame, (x, y - th - 10), (x + tw, y), color, -1)
-        cv2.putText(frame, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), results
+        draw_box(frame, x, y, w, h,
+                 result["top_label"], result["top_emoji"], result["top_score"])
+    return frame, results
+
+
+def annotate_frame(frame: np.ndarray) -> tuple:
+    """Same as above but returns RGB (for st.image)."""
+    annotated_bgr, results = annotate_frame_bgr(frame)
+    return cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), results
 
 
 def render_result(result: dict, expanded: bool):
@@ -117,53 +120,53 @@ def tab_upload():
 
 def tab_live_camera():
     st.header("📷 Live Camera")
-    if is_running_on_cloud():
-        st.warning("📵 Webcam is unavailable on Streamlit Community Cloud. Run locally to use the camera.")
+    st.caption("Streams from your browser camera — works locally and on Streamlit Cloud. Allow camera access when prompted.")
+    try:
+        from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
+    except ImportError:
+        st.error("Live camera needs the `streamlit-webrtc` package (not installed).")
         return
+    try:
+        load_vit_cached(HF_MODEL_ID)  # warm up so first frames aren't blank
+    except Exception:
+        pass
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("▶️ Start Camera", disabled=st.session_state.camera_running, width="stretch"):
-            st.session_state.camera_running = True
-            st.rerun()
-    with col2:
-        if st.button("⏹️ Stop Camera", disabled=not st.session_state.camera_running, width="stretch"):
-            st.session_state.camera_running = False
-            st.rerun()
+    class EmotionVideoProcessor(VideoProcessorBase):
+        def __init__(self):
+            self._frame_idx = 0
+            self._cached_boxes: list = []  # (x, y, w, h, label, emoji, score)
 
-    if not st.session_state.camera_running:
-        st.info("Press **Start Camera** to begin real-time detection.")
-    else:
-        feed = st.empty()
-        cap = cv2.VideoCapture(int(os.getenv("CAMERA_INDEX", "0")))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        try:
-            for _ in range(300):
-                if not st.session_state.camera_running:
-                    break
-                ret, frame = cap.read()
-                if not ret:
-                    st.error("Failed to capture frame from camera.")
-                    break
-                annotated, results = annotate_frame(frame)
-                feed.image(annotated, width="stretch")
-                for r in results:
-                    st.session_state.emotion_history.append(r["top_label"])
-                time.sleep(0.03)
-        finally:
-            cap.release()
-            st.session_state.camera_running = False
+        def recv(self, frame):
+            import av
 
-    if st.session_state.emotion_history:
-        st.subheader("Recent Detections")
-        counts = Counter(st.session_state.emotion_history)
-        total = sum(counts.values())
-        for label in EMOTION_LABELS:
-            st.progress(
-                counts[label] / total,
-                text=f"{EMOTION_EMOJIS[label]} {label.capitalize()} — {counts[label]}",
-            )
+            img = frame.to_ndarray(format="bgr24")
+            self._frame_idx += 1
+            # ViT on CPU is slow: full inference every 5th frame, reuse boxes between.
+            if self._frame_idx % 5 == 1:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                faces = get_face_cascade().detectMultiScale(
+                    gray, scaleFactor=1.3, minNeighbors=5, minSize=(48, 48)
+                )
+                boxes = []
+                for (x, y, w, h) in faces:
+                    try:
+                        r = predict_roi(img[y:y + h, x:x + w])
+                        boxes.append((x, y, w, h, r["top_label"], r["top_emoji"], r["top_score"]))
+                    except Exception:
+                        continue
+                self._cached_boxes = boxes
+            for (x, y, w, h, label, emoji, score) in self._cached_boxes:
+                draw_box(img, int(x), int(y), int(w), int(h), label, emoji, float(score))
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+    webrtc_streamer(
+        key="emotion-live",
+        video_processor_factory=EmotionVideoProcessor,
+        rtc_configuration=RTCConfiguration(
+            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        ),
+        media_stream_constraints={"video": True, "audio": False},
+    )
 
 
 def tab_about():
@@ -184,11 +187,6 @@ def tab_about():
 
 def main():
     st.set_page_config(page_title="Emotion Recognition", page_icon="🧠", layout="wide")
-
-    if "camera_running" not in st.session_state:
-        st.session_state.camera_running = False
-    if "emotion_history" not in st.session_state:
-        st.session_state.emotion_history = deque(maxlen=50)
 
     try:
         load_vit_cached(HF_MODEL_ID)
