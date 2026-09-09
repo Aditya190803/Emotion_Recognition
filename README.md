@@ -9,7 +9,9 @@ End-to-end facial emotion recognition system with automatic dataset download, de
 
 ## ✨ Features
 
-- **🌐 Automatic Dataset Download** — One-click FER2013 download from the sidebar
+- **✨ SOTA ViT Backend (default)** — `mo-thecreator/vit-Facial-Expression-Recognition` (ViT-Base, FER2013+AffectNet+MMI, ~84.9% eval) via HuggingFace `transformers` — auto-downloads on first use, no training needed
+- **🗂️ Legacy Keras Fallback** — Switch to any local `.keras` checkpoint from the sidebar
+- **🌐 Automatic Dataset Download** — One-click FER2013 download from the sidebar (only needed for retraining legacy CNNs)
 - **🏋️ In-App Model Training** — Train new CNN models directly from the web UI (runs in background)
 - **📁 Model Selection** — Switch between multiple `.keras` checkpoints from the sidebar
 - **📷 Real-Time Webcam Detection** — Live camera feed with face bounding boxes and emotion overlays *(local only)*
@@ -101,7 +103,8 @@ The app is controlled entirely from the **left sidebar**:
 - View per-split image counts
 
 ### 🏋️ Train Model
-- Adjust **epochs** (5–100) and **batch size** (16–128)
+- Choose a **backbone** (MobileNetV2 — fast, or EfficientNetB0 — more accurate)
+- Adjust **epochs** (5–200) and **batch size** (16–64)
 - Training runs in a **background subprocess** — UI stays responsive
 - Live training log streaming
 - New model is auto-timestamped: `emotion_model_YYYYMMDD_HHMMSS.keras`
@@ -123,29 +126,40 @@ The easiest way to train:
 
 ### From Command Line
 ```bash
-# Default settings (50 epochs, batch 64)
+# Default settings (60 epochs total, batch 32, MobileNetV2 backbone)
 python train_model.py
 
 # Custom settings
-python train_model.py --epochs 30 --batch-size 32 --model my_model.keras
+python train_model.py --epochs 80 --batch-size 16 --backbone efficientnetb0 --model my_model.keras
 ```
 
+**Training strategy (two-phase transfer learning):**
+1. **Phase 1** — ImageNet-pretrained backbone is frozen; only the classification head trains (~25% of epochs) at LR `0.01`
+2. **Phase 2** — top 30% of backbone blocks unfreeze (BatchNorm stays frozen); fine-tuned at LR `1e-4` (~75% of epochs)
+
+**Accuracy techniques built in:**
+- Transfer learning from **ImageNet weights** (MobileNetV2 / EfficientNetB0)
+- **Label smoothing** (0.1) — FER2013 labels are noisy
+- **SGD + Nesterov momentum** with `ReduceLROnPlateau` (best optimizer combo for FER2013)
+- In-graph data augmentation (flip, rotation, translation, zoom, contrast)
+- Class weighting for imbalanced classes (e.g. *disgust* has ~10x fewer images than *happy*)
+
 **Callbacks:**
-- `EarlyStopping` — stops if validation loss plateaus (patience=8)
-- `ModelCheckpoint` — saves the best model
-- `ReduceLROnPlateau` — reduces learning rate on plateau
+- `EarlyStopping` — stops if validation loss plateaus, restores best weights
+- `ModelCheckpoint` — saves the best model by validation accuracy
+- `ReduceLROnPlateau` — halves the learning rate on plateau
 
-### Model Architecture
+> **Note:** models trained with this script take raw RGB `[0, 255]` input at 224×224 — normalization is baked into the model graph. The app and realtime script detect this automatically, so old (48×48 grayscale) and new checkpoints can coexist.
 
-| Layer | Details |
-|-------|---------|
-| Conv2D (32) + BN + Conv2D (32) + BN + MaxPool + Dropout | Input block |
-| Conv2D (64) + BN + Conv2D (64) + BN + MaxPool + Dropout | |
-| Conv2D (128) + BN + Conv2D (128) + BN + MaxPool + Dropout | |
-| Conv2D (256) + BN + Conv2D (256) + BN + MaxPool + Dropout | |
-| Flatten + Dense(256) + BN + Dropout(0.5) | |
-| Dense(128) + BN + Dropout(0.5) | |
-| Dense(7) Softmax | Output |
+### Expected accuracy
+| Approach | FER2013 test accuracy |
+|----------|----------------------|
+| Human | ~65–68% |
+| Legacy from-scratch CNN (`48×48`) | ~63–68% |
+| MobileNetV2/EfficientNetB0 transfer (old default) | ~72–77% |
+| **ViT SOTA `mo-thecreator/vit-Facial-Expression-Recognition` (new default)** | **~84–85%** (multi-dataset: FER2013+AffectNet+MMI) |
+
+> Paper SOTA (POSTER-Var, MSAG-graph, FERMam, IAE-Net) reports 90–93% but ships no pip-installable weights — this HF ViT is the best **readily-available** plug-and-play model (Sept 2026 research).
 
 ---
 
@@ -181,7 +195,7 @@ git push origin main
 
 ### Notes
 - The app detects cloud environments and **disables webcam** automatically
-- Training works on Cloud but is CPU-only (slower)
+- Training works on Cloud but is CPU-only (slow — prefer local GPU for the 224×224 transfer-learning models)
 - For webcam testing, run the app **locally**
 - System dependencies (`libgl1` for OpenCV) are declared in `packages.txt`
 
@@ -198,8 +212,11 @@ Press **ESC** to exit.
 
 Options:
 ```bash
-python realtime_prediction.py --model emotion_model.keras --camera 0
+python realtime_prediction.py --model emotion_model.keras --camera 0 --tta
 ```
+
+`--tta` averages predictions over the horizontal flip (more accurate, ~2x slower).
+The script auto-detects input size/channels/normalization from the selected model.
 
 ---
 
