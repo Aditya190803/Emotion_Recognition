@@ -4,7 +4,8 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 streamlit>=1.37,<2
-opencv-python-headless>=4.9
+# NOTE: <5 — OpenCV 5.x removed the Haar CascadeClassifier API this app uses.
+opencv-python-headless>=4.9,<5
 numpy>=1.26
 pillow>=10
 torch>=2.5
