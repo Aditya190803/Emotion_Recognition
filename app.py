@@ -51,6 +51,9 @@ DATASET_DIR = Path(os.getenv("DATASET_DIR", "dataset"))
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 TRAIN_LOG_PATH = Path("training_log.txt")
 TRAIN_LOCK_PATH = Path("training.lock")
+HF_MODEL_ID = os.getenv(
+    "HF_MODEL_ID", "mo-thecreator/vit-Facial-Expression-Recognition"
+)  # SOTA plug-and-play ViT (~84.9% eval, FER2013+AffectNet+MMI)
 
 EMOTION_LABELS = [
     "angry", "disgust", "fear", "happy",
@@ -97,8 +100,24 @@ def get_selected_model_path() -> Optional[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Model loading (cached per path)
+# Model loading — ViT (SOTA, default) + legacy Keras fallback
 # ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Loading ViT emotion model...")
+def load_vit_cached(model_id: str):
+    from emotion_vit import _load_vit
+    return _load_vit(model_id)
+
+
+def get_backend() -> str:
+    return st.session_state.get("backend", "vit")
+
+
+def is_model_ready() -> bool:
+    if get_backend() == "vit":
+        return True  # downloaded lazily from HF on first prediction
+    return get_selected_model_path() is not None
+
+
 @st.cache_resource(show_spinner="Loading model...")
 def load_model_cached(path: str) -> Optional[tf.keras.Model]:
     p = Path(path)
@@ -123,6 +142,17 @@ def get_model() -> Optional[tf.keras.Model]:
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def get_face_cascade():
+    # opencv-python 5.x removed the Haar CascadeClassifier API; this app needs 4.x.
+    # If you see this error, restart Streamlit after (re)installing deps:
+    #   pip install "opencv-python>=4.8,<5"
+    if not hasattr(cv2, "CascadeClassifier"):
+        raise RuntimeError(
+            f"Broken OpenCV ({getattr(cv2, '__version__', '?')}): "
+            "cv2.CascadeClassifier is missing. Your running Streamlit process "
+            "likely loaded opencv 5.x before it was downgraded — stop the server "
+            "(Ctrl+C) and restart it. If it persists, run: "
+            'pip install "opencv-python>=4.8,<5"'
+        )
     return cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     )
@@ -136,19 +166,59 @@ def detect_faces(gray: np.ndarray):
 # ---------------------------------------------------------------------------
 # Prediction helpers
 # ---------------------------------------------------------------------------
-def preprocess_face(face_roi: np.ndarray) -> np.ndarray:
-    face = cv2.resize(face_roi, (48, 48))
-    face = face.astype("float32") / 255.0
-    face = np.expand_dims(face, axis=0)
-    face = np.expand_dims(face, axis=-1)
-    return face
+def get_model_input_spec(model: tf.keras.Model) -> tuple[int, int, int]:
+    """Return (height, width, channels) expected by the model."""
+    shape = model.input_shape
+    return int(shape[1]), int(shape[2]), int(shape[3])
+
+
+def _has_builtin_normalization(model: tf.keras.Model) -> bool:
+    """
+    True if the model normalizes inputs itself (transfer-learning models),
+    i.e. it expects raw RGB values in [0, 255]. Legacy models expect /255.
+    """
+    def check(layers) -> bool:
+        for layer in layers:
+            name = getattr(layer, "name", "").lower()
+            if isinstance(layer, tf.keras.layers.Rescaling) or "rescaling" in name \
+                    or "efficientnet" in name:
+                return True
+        return False
+
+    if check(model.layers):
+        return True
+    # Also look one level deep (nested backbone sub-model)
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.Model) and check(layer.layers):
+            return True
+    return False
+
+
+def preprocess_face(face_roi_bgr: np.ndarray, model: tf.keras.Model) -> np.ndarray:
+    """Resize/convert a BGR face ROI to match whatever model is selected."""
+    h, w, c = get_model_input_spec(model)
+    face = cv2.resize(face_roi_bgr, (w, h))
+    if c == 1:
+        # Legacy grayscale CNN trained on /255-scaled images
+        arr = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY).astype("float32") / 255.0
+        arr = arr[..., np.newaxis]
+    else:
+        if _has_builtin_normalization(model):
+            arr = face.astype("float32")  # raw [0, 255]; model normalizes internally
+        else:
+            arr = face.astype("float32") / 255.0
+    return np.expand_dims(arr, axis=0)
 
 
 def predict_emotion(face_input: np.ndarray) -> dict:
+    """Legacy Keras path (TTA flip-averaged). For ViT use predict_emotion_roi()."""
     model = get_model()
     if model is None:
         raise RuntimeError("No model loaded.")
+    # Test-time augmentation: average prediction with the horizontal flip (+~1% acc)
     preds = model.predict(face_input, verbose=0)[0]
+    flipped = model.predict(face_input[:, :, ::-1, :], verbose=0)[0]
+    preds = (preds + flipped) / 2.0
     predictions = [
         {"label": label, "score": float(score), "emoji": EMOTION_EMOJIS[label]}
         for label, score in zip(EMOTION_LABELS, preds)
@@ -162,16 +232,32 @@ def predict_emotion(face_input: np.ndarray) -> dict:
     }
 
 
+def predict_emotion_roi(roi_bgr: np.ndarray) -> dict:
+    """Route a BGR face ROI to the active backend (ViT default, Keras fallback)."""
+    if get_backend() == "vit":
+        from emotion_vit import predict_emotion_vit
+        model_id = st.session_state.get("hf_model_id", HF_MODEL_ID)
+        return predict_emotion_vit(roi_bgr, model_id=model_id)
+    model = get_model()
+    if model is None:
+        raise RuntimeError("No model loaded.")
+    return predict_emotion(preprocess_face(roi_bgr, model))
+
+
 def annotate_frame(frame: np.ndarray) -> tuple:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = detect_faces(gray)
     results = []
+    keras_model = get_model() if get_backend() == "keras" else None
     for (x, y, w, h) in faces:
         color = (0, 255, 0)
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-        roi = gray[y:y + h, x:x + w]
-        face_input = preprocess_face(roi)
-        result = predict_emotion(face_input)
+        roi = frame[y:y + h, x:x + w]  # keep color; preprocessing adapts per model
+        if get_backend() == "vit":
+            result = predict_emotion_roi(roi)
+        else:
+            face_input = preprocess_face(roi, keras_model)
+            result = predict_emotion(face_input)
         results.append(result)
         text = f"{result['top_label']} {result['top_emoji']} {result['top_score'] * 100:.0f}%"
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
@@ -220,11 +306,41 @@ def count_dataset_images() -> dict:
 # ---------------------------------------------------------------------------
 def render_sidebar():
     st.sidebar.title("🧠 Emotion Recognition")
-    st.sidebar.markdown("Production-ready facial emotion detection with CNN.")
+    st.sidebar.markdown("SOTA ViT facial emotion detection (HF) + legacy Keras fallback.")
     st.sidebar.divider()
 
-    # --- Model Management ---
-    st.sidebar.subheader("📁 Model Management")
+    # --- Backend selection (SOTA first) ---
+    st.sidebar.subheader("🧠 Backend")
+    backend = st.sidebar.radio(
+        "Prediction engine",
+        ["vit", "keras"],
+        format_func=lambda x: "✨ ViT SOTA (~84.9%) — Recommended"
+        if x == "vit" else "🗂️ Legacy Keras (.keras)",
+        index=0 if st.session_state.get("backend", "vit") == "vit" else 1,
+        key="backend_radio",
+    )
+    st.session_state.backend = backend
+    if backend == "vit":
+        hf_id = st.sidebar.text_input("HF model", value=st.session_state.get("hf_model_id", HF_MODEL_ID))
+        st.session_state.hf_model_id = hf_id
+        from emotion_vit import ensure_vit_snapshot, is_vit_cached_locally
+        if is_vit_cached_locally(hf_id):
+            st.sidebar.caption("💾 Weights cached on disk (`./models/`) — fast/offline load")
+        elif st.sidebar.button("⬇️ Cache model on disk (~350MB, one-time)", key="cache_vit"):
+            with st.spinner("Downloading ViT weights (one-time)..."):
+                ensure_vit_snapshot(hf_id)
+            load_vit_cached.clear()
+            st.rerun()
+        try:
+            load_vit_cached(hf_id)
+            st.sidebar.success("✅ ViT loaded")
+            st.sidebar.caption(f"`{hf_id}` — ViT-Base, 7 emotions, 224×224")
+        except Exception as exc:
+            st.sidebar.warning(f"⏳ ViT downloads on first use ({exc!s:.120})")
+    st.sidebar.divider()
+
+    # --- Model Management (legacy Keras) ---
+    st.sidebar.subheader("📁 Legacy Keras Models")
     models = get_available_models()
 
     model_names = [str(m.name) for m in models]
@@ -296,8 +412,11 @@ def render_sidebar():
         if st.sidebar.button("🔄 Refresh Status", width="stretch", key="refresh_status"):
             st.rerun()
     else:
-        epochs = st.sidebar.slider("Epochs", 5, 100, 50, 5)
-        batch_size = st.sidebar.select_slider("Batch size", options=[16, 32, 64, 128], value=64)
+        backbone = st.sidebar.select_slider(
+            "Backbone", options=["mobilenetv2", "efficientnetb0"], value="mobilenetv2"
+        )
+        epochs = st.sidebar.slider("Epochs", 5, 200, 60, 5)
+        batch_size = st.sidebar.select_slider("Batch size", options=[16, 32, 64], value=32)
 
         train_disabled = not dataset_exists()
         if train_disabled:
@@ -318,6 +437,7 @@ def render_sidebar():
                 "train_model.py",
                 "--epochs", str(epochs),
                 "--batch-size", str(batch_size),
+                "--backbone", backbone,
                 "--model", f"{model_name}.keras",
                 "--history", f"training_history_{model_name}.json",
             ]
@@ -344,14 +464,15 @@ def render_sidebar():
 # Main: Status banner
 # ---------------------------------------------------------------------------
 def render_status_banner():
-    model = get_model()
+    ready = is_model_ready()
     dataset_ok = dataset_exists()
     on_cloud = is_running_on_streamlit_cloud()
 
     cols = st.columns(3)
     with cols[0]:
-        if model is not None:
-            st.success("✅ Model Ready")
+        if ready:
+            label = "ViT SOTA" if get_backend() == "vit" else "Keras"
+            st.success(f"✅ Model Ready ({label})")
         else:
             st.error("❌ No Model")
     with cols[1]:
@@ -411,8 +532,7 @@ def tab_live_camera():
         st.info("You can still test with the **Upload Image** tab.")
         return
 
-    model = get_model()
-    if model is None:
+    if not is_model_ready():
         st.warning("Model not loaded. Train or select a model first.")
         return
 
@@ -487,8 +607,7 @@ def tab_upload():
     st.header("🖼️ Upload Image")
     st.caption("Upload a photo to detect emotions.")
 
-    model = get_model()
-    if model is None:
+    if not is_model_ready():
         st.warning("Model not loaded. Train or select a model first.")
         return
 
@@ -564,6 +683,18 @@ def tab_model_info():
 
     # Model summary
     st.subheader("Model Summary")
+    if get_backend() == "vit":
+        hf_id = st.session_state.get("hf_model_id", HF_MODEL_ID)
+        st.json({
+            "backend": "ViT SOTA (HuggingFace)",
+            "model_id": hf_id,
+            "architecture": "ViT-Base patch16-224",
+            "training_data": "FER2013 + AffectNet + MMI",
+            "eval_accuracy": "~84.3-84.9%",
+            "input": "224x224 RGB",
+            "classes": EMOTION_LABELS,
+        })
+        st.info("ViT is the active backend. Switch to Legacy Keras below to inspect .keras checkpoints.")
     model = get_model()
     if model is not None:
         path = get_selected_model_path()
@@ -638,6 +769,8 @@ def init_state():
         "emotion_history": deque(maxlen=50),
         "last_upload_result": None,
         "selected_model": "",
+        "backend": "vit",
+        "hf_model_id": HF_MODEL_ID,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
