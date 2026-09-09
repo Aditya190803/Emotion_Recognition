@@ -1,2 +1,0 @@
-# No system packages needed (opencv-python-headless has no libGL dependency).
-# Keep this file so Streamlit Cloud skips apt entirely.
