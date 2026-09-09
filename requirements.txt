@@ -1,21 +1,12 @@
-# Streamlit Community Cloud requirements — flexible lower bounds on purpose.
-# Cloud runs a newer Python (3.12/3.13) where old exact pins have no wheels,
-# forcing slow source builds that kill the installer. Ranges let pip pick
-# the newest wheel compatible with whatever Python Cloud uses.
-# Default backend is the HF ViT (torch), so TensorFlow is NOT installed here.
-# (TF + torch together exceed Cloud's RAM and break the installer.)
-# Keras fallback only works on local runs: pip install tensorflow-cpu locally.
+# Streamlit Community Cloud requirements — ViT-only app.
+# Flexible lower bounds so Cloud's Python (3.12/3.13) resolves wheels
+# instead of attempting slow source builds that kill the installer.
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 streamlit>=1.37,<2
 opencv-python-headless>=4.9
 numpy>=1.26
 pillow>=10
-pandas>=2
-scikit-learn>=1.3
-python-dotenv>=1.0
-matplotlib>=3.7
-requests>=2.31
 torch>=2.5
 torchvision>=0.20
 transformers>=4.44
