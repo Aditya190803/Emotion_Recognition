@@ -1,5 +1,5 @@
 tensorflow>=2.15.0
-opencv-python>=4.8.0
+opencv-python>=4.8,<5  # 5.x removed CascadeClassifier (Haar) API this app uses
 streamlit>=1.32.0
 numpy>=1.24.0
 pandas>=2.0.0
@@ -8,3 +8,10 @@ pillow>=10.0.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 matplotlib>=3.7.0
+# SOTA ViT emotion backend (default) — CPU wheels recommended on Windows:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+torchvision>=0.18.0
+transformers>=4.36.0
+huggingface_hub>=0.20.0
+safetensors>=0.4.0
